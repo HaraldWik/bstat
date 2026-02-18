@@ -99,25 +99,42 @@ pub fn main(init: std.process.Init) !void {
 
     const stat = try std.Io.Dir.cwd().statFile(io, sub_path, .{ .follow_symlinks = true });
 
-    var stdout_writer_buffer: [512]u8 = undefined;
-    var stdout_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_writer_buffer);
-    const stdout = &stdout_writer.interface;
+    var output_writer_buffer: [128]u8 = undefined;
+    var output_writer: std.Io.File.Writer = .init(.stdout(), io, &output_writer_buffer);
+    const output = &output_writer.interface;
 
-    try stdout.print("{t}: {s}\n", .{ stat.kind, std.Io.Dir.path.basename(sub_path) });
-    if (stat.kind != .directory) {
-        try stdout.writeAll("size: ");
-        try config.size.format(stdout, stat.size);
-        try stdout.writeByte('\n');
+    try output.print("{t}: {s}\n", .{ stat.kind, std.Io.Dir.path.basename(sub_path) });
 
-        if (config.show_block_size) try stdout.print("block size: {d}\n", .{stat.block_size});
-    }
+    try output.writeAll("size: ");
+    const size = if (stat.kind != .directory) stat.size else size: {
+        var stdout_writer_buffer: [6]u8 = undefined;
+        var stdout_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_writer_buffer);
+        const stdout = &stdout_writer.interface;
+
+        var loading_future = try io.concurrent(loading, .{ io, stdout });
+
+        const dir = try std.Io.Dir.cwd().openDir(io, sub_path, .{ .iterate = true });
+        defer dir.close(io);
+        const size = try getDirectorySizeRecursive(io, dir);
+
+        _ = loading_future.cancel(io) catch {};
+        try stdout.writeByte('\r');
+        try stdout.flush();
+
+        break :size size;
+    };
+    try config.size.format(output, size);
+    try output.writeByte('\n');
+
+    if (stat.kind != .directory and config.show_block_size) try output.print("block size: {d}\n", .{stat.block_size});
+
     if (config.show_permissions) {
         const mode: std.posix.mode_t = stat.permissions.toMode();
         const buf = posixSymbolicFileMode(stat.kind, mode);
-        try stdout.print("permissions: ({o:0>4}/{s})\n", .{ mode & 0o7777, buf });
+        try output.print("permissions: ({o:0>4}/{s})\n", .{ mode & 0o7777, buf });
     }
 
-    try stdout.flush();
+    try output.flush();
 }
 
 /// Converts a file's kind and mode to the POSIX symbolic file mode string,
@@ -159,4 +176,46 @@ pub fn posixSymbolicFileMode(kind: std.Io.File.Kind, mode: std.posix.mode_t) [10
     else if (mode & std.posix.S.IXOTH != 0) 'x' else '-';
 
     return buf;
+}
+
+pub fn getDirectorySizeRecursive(io: std.Io, dir: std.Io.Dir) !u64 {
+    var size: u64 = 0;
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| switch (entry.kind) {
+        .directory => {
+            const sub_dir = try dir.openDir(io, entry.name, .{ .iterate = true });
+            defer sub_dir.close(io);
+
+            size += try getDirectorySizeRecursive(io, sub_dir);
+        },
+        else => {
+            const stat = dir.statFile(io, entry.name, .{}) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            size += stat.size;
+        },
+    };
+
+    return size;
+}
+
+pub fn loading(io: std.Io, writer: *std.Io.Writer) !void {
+    var index: usize = 0;
+    const loading_bars: []const []const u8 = &.{
+        "·..",
+        ".·.",
+        "..·",
+        ".·.",
+    };
+
+    while (true) : (index += 1) {
+        const current_loading_bar = loading_bars[index % loading_bars.len];
+        try writer.writeByte('\r');
+        try writer.writeAll(current_loading_bar);
+        try writer.flush();
+
+        _ = try io.sleep(.fromMilliseconds(100), .real);
+    }
 }
